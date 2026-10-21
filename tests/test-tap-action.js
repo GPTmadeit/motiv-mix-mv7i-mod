@@ -70,7 +70,7 @@ function fakeDevice(id, model = "MV7i") {
   };
   const listeners = new Map();
   const device = {
-    hardwareId: id, model, deviceState: "ONLINE", category: 1, interfaceId: 1, writes: [], subscribed: [],
+    hardwareId: id, model, deviceState: "ONLINE", category: 1, interfaceId: 1, writes: [], subscribed: [], aggregation: {},
     getProperty: async key => (key in props ? props[key] : { code: "INVALID_PROPERTY" }),
     updateProperty(key, value) {
       onWrite(device, key, value); // mirrors the hook in Device.updateProperty
@@ -79,11 +79,28 @@ function fakeDevice(id, model = "MV7i") {
       return Promise.resolve(true);
     },
     // Mirrors NdlDeviceManager.subscribeProperties: a snapshot, then updates until aborted.
-    subscribeProperties(keys, signal) {
+    // device.batchMs mimics NDL's event aggregation: only the latest value per batch is reported,
+    // even when it ended up unchanged. device.rejectAggregation makes short batches fail.
+    subscribeProperties(keys, signal, aggregationMs) {
       device.subscribed.push(...keys);
+      for (const k of keys) device.aggregation[k] = aggregationMs;
+      if (device.rejectAggregation && aggregationMs !== undefined) {
+        return (async function* () { yield { type: "error", message: "bad interval" }; await new Promise(() => {}); })();
+      }
       const queue = [{ type: "snapshot", properties: new Map(keys.map(k => [k, props[k]])) }];
       let wake;
-      for (const k of keys) listeners.set(k, event => { queue.push(event); wake?.(); });
+      const batch = new Map();
+      let timer;
+      for (const k of keys) listeners.set(k, event => {
+        if (!device.batchMs) { queue.push(event); wake?.(); return; }
+        for (const [key, value] of event.properties) batch.set(key, value);
+        timer ??= setTimeout(() => {
+          timer = undefined;
+          queue.push({ type: "update", properties: new Map(batch) });
+          batch.clear();
+          wake?.();
+        }, device.batchMs);
+      });
       signal.addEventListener("abort", () => wake?.());
       return (async function* () {
         while (!signal.aborted) {
@@ -225,23 +242,37 @@ const STOCK_LIGHTS = [0, BLUE, 0, BLUE];
   onManager(goodManager, { parseDeviceDescription: () => description });
 
   // --- double tap switches between reverb and mute mode ---
-  await call("set", { mode: "reverb", greenLeds: false, doubleTapSwitch: true });
+  await call("set", { mode: "reverb", greenLeds: false, doubleTapSwitch: true, doubleTapWindowMs: 500 });
   await wait(550);
   d = fakeDevice("dt1");
   await connect(d);
+  assert.strictEqual(d.aggregation[MUTE], 10, "mute subscriptions ask for short event batches");
+  assert.strictEqual(d.aggregation[REVERB], undefined);
   tap(d); await tick();
-  assert.deepStrictEqual(d.writes, [[MUTE, false]], "mute undone at once, reverb waits for a possible second tap");
+  assert.deepStrictEqual(d.writes, [], "nothing is written while a second tap may still come");
   await wait(550);
-  assert.deepStrictEqual(d.writes, [[MUTE, false], [REVERB, true]], "single tap toggles reverb after the window");
+  assert.deepStrictEqual(d.writes, [[MUTE, false], [REVERB, true]], "single tap: unmute and toggle reverb after the window");
+  assert.match(status(), /last: single tap/);
 
   await wait(100);
   tap(d); await wait(150); tap(d); await wait(600);
   assert.strictEqual((await call("state")).mode, "mute", "double tap switches reverb -> mute");
   assert.strictEqual(d.props[REVERB], true, "double tap does not toggle reverb");
   assert.strictEqual(d.props[MUTE], false, "mic ends unmuted");
+  assert.deepStrictEqual(d.writes.length, 2, "no writes for a double tap");
+  assert.match(status(), /last: double tap \(0\.1\d s apart\)/);
+
+  // a quick second tap right after the first, which v3.1 mistook for the echo of its own un-mute
+  await call("set", { mode: "reverb" });
+  d = fakeDevice("dt-race");
+  await connect(d);
+  tap(d); tap(d); await wait(600);
+  assert.strictEqual((await call("state")).mode, "mute");
+  assert.strictEqual(d.props[MUTE], false);
 
   // now in mute mode: a single tap just mutes (firmware), a double tap switches back
-  d.writes.length = 0;
+  d = fakeDevice("dt1b");
+  await connect(d);
   tap(d); await wait(600);
   assert.deepStrictEqual(d.writes, [], "mute mode leaves the firmware mute alone");
   assert.strictEqual(d.props[MUTE], true);
@@ -254,11 +285,16 @@ const STOCK_LIGHTS = [0, BLUE, 0, BLUE];
   // one tap that flips two channels is still one tap, and so is a double tap of it
   d = fakeDevice("dt2");
   await connect(d);
-  tap(d, MUTE); tap(d, MUTE2); await wait(150); tap(d, MUTE); tap(d, MUTE2); await wait(600);
+  tap(d, MUTE); tap(d, MUTE2); await wait(150); tap(d, MUTE); tap(d, MUTE2); await wait(700);
   assert.strictEqual((await call("state")).mode, "mute", "multi-channel double tap switches once");
   assert.strictEqual(d.props[REVERB], false);
-  tap(d, MUTE); tap(d, MUTE2); await wait(150); tap(d, MUTE); tap(d, MUTE2); await wait(600);
+  tap(d, MUTE); tap(d, MUTE2); await wait(150); tap(d, MUTE); tap(d, MUTE2); await wait(700);
   assert.strictEqual((await call("state")).mode, "reverb");
+  assert.deepStrictEqual([d.props[MUTE], d.props[MUTE2]], [false, false]);
+
+  // single multi-channel tap in reverb mode: both channels unmuted, reverb toggled once
+  tap(d, MUTE); tap(d, MUTE2); await wait(600);
+  assert.deepStrictEqual([d.props[MUTE], d.props[MUTE2], d.props[REVERB]], [false, false, true]);
 
   // taps further apart than the window are two single taps
   d = fakeDevice("dt3");
@@ -266,6 +302,34 @@ const STOCK_LIGHTS = [0, BLUE, 0, BLUE];
   tap(d); await wait(650); tap(d); await wait(600);
   assert.strictEqual((await call("state")).mode, "reverb");
   assert.deepStrictEqual(d.writes.filter(([k]) => k === REVERB), [[REVERB, true], [REVERB, false]]);
+
+  // a longer window catches slower double taps
+  await call("set", { doubleTapWindowMs: 1200 });
+  tap(d); await wait(900); tap(d); await wait(1300);
+  assert.strictEqual((await call("state")).mode, "mute", "relaxed window: taps 0.9 s apart are a double tap");
+  await call("set", { mode: "reverb", doubleTapWindowMs: 500 });
+  assert.throws(() => call("set", { doubleTapWindowMs: 7 }));
+
+  // NDL batching: both flips land in one batch and arrive as "unchanged"
+  d = fakeDevice("dt-batch"); d.batchMs = 250;
+  await connect(d);
+  tap(d); await wait(50); tap(d); await wait(400);
+  assert.strictEqual((await call("state")).mode, "mute", "double tap inside one batch still switches");
+  assert.strictEqual(d.props[MUTE], false);
+  assert.match(status(), /last: double tap \(fast\)/);
+  tap(d, MUTE); tap(d, MUTE2); await wait(50); tap(d, MUTE); tap(d, MUTE2); await wait(400);
+  assert.strictEqual((await call("state")).mode, "reverb", "multi-channel batched double tap switches once");
+  // with batching, a single tap still works
+  tap(d); await wait(900);
+  assert.strictEqual(d.props[REVERB], true);
+  assert.strictEqual(d.props[MUTE], false);
+
+  // NDL refuses the short batch interval: fall back to its default
+  d = fakeDevice("dt-reject"); d.rejectAggregation = true;
+  await connect(d); await tick();
+  assert.strictEqual(d.aggregation[MUTE], undefined, "resubscribed with default batching");
+  tap(d); await wait(600);
+  assert.strictEqual(d.props[REVERB], true, "taps still work after the fallback");
 
   // mute + reverb mode: a double tap goes to mute mode
   await call("set", { mode: "mute+reverb" });
@@ -279,9 +343,9 @@ const STOCK_LIGHTS = [0, BLUE, 0, BLUE];
   await call("set", { mode: "reverb", doubleTapSwitch: false });
   d = fakeDevice("dt5");
   await connect(d);
-  tap(d); await tick();
-  assert.deepStrictEqual(d.writes, [[MUTE, false], [REVERB, true]], "no delay when double tap is off");
-  await wait(150); tap(d); await tick();
+  tap(d, MUTE); tap(d, MUTE2); await tick();
+  assert.deepStrictEqual(d.writes, [[MUTE, false], [MUTE2, false], [REVERB, true]], "no delay when double tap is off");
+  await wait(350); tap(d); await tick();
   assert.strictEqual(d.props[REVERB], false);
   assert.strictEqual((await call("state")).mode, "reverb");
   await call("set", { greenLeds: true });
@@ -291,7 +355,7 @@ const STOCK_LIGHTS = [0, BLUE, 0, BLUE];
   assert.strictEqual(state.mode, "reverb");
   assert.strictEqual(state.greenLeds, true);
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(userData, "tap-action.json"))),
-    { mode: "reverb", greenLeds: true, doubleTapSwitch: false, autoUpdateCheck: true });
+    { mode: "reverb", greenLeds: true, doubleTapSwitch: false, doubleTapWindowMs: 500, autoUpdateCheck: true });
   assert.throws(() => call("set", { mode: "explode" }));
   assert.throws(() => handlers["motiv-tap-action:state"]({ senderFrame: { url: "https://evil.example" } }));
 

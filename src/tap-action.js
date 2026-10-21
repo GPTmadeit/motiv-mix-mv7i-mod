@@ -10,7 +10,7 @@
 //   "reverb"      - put mute back the way it was, toggle reverb
 //   "mute+reverb" - leave mute alone, toggle reverb
 // A double tap switches between reverb and mute mode; single taps then wait
-// DOUBLE_TAP_MS before acting, to be sure no second tap is coming.
+// settings.doubleTapWindowMs before acting, to be sure no second tap is coming.
 const { app, ipcMain, net, shell } = require("electron");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
@@ -18,20 +18,22 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const MOD_VERSION = "3.1.0";
+const MOD_VERSION = "3.2.0";
 const REPO = "GPTmadeit/motiv-mix-mv7i-mod";
 const INSTALLER_ASSET = "MV7i-Mod-Installer.cmd";
 
 const MODES = ["mute", "reverb", "mute+reverb"];
-const DEFAULT_SETTINGS = { mode: "mute", greenLeds: true, doubleTapSwitch: true, autoUpdateCheck: true };
+const DEFAULT_SETTINGS = { mode: "mute", greenLeds: true, doubleTapSwitch: true, doubleTapWindowMs: 800, autoUpdateCheck: true };
+const DOUBLE_TAP_WINDOWS = [500, 800, 1200];
 const isMv7i = device => String(device?.model ?? "").toUpperCase().startsWith("MV7I");
 // A mute event matching one of the app's own writes within this window is not a tap.
 const SELF_WRITE_WINDOW_MS = 2500;
 // One tap can flip several mute keys (device + channels). Flips of keys not yet seen
 // within this window belong to the same tap; a key flipping again is a new tap.
 const SAME_TAP_MS = 300;
-// A second tap starting within this window of the first is a double tap.
-const DOUBLE_TAP_MS = 500;
+// NDL batches property events and reports only the latest value per batch, which can swallow
+// a quick muted -> unmuted double tap. Mute subscriptions ask for short batches instead.
+const MUTE_AGGREGATION_MS = 10;
 const UPDATE_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000;
 const MUTE = "AUDIO:MUTE";
 const REVERB = "AUDIO:REVERB_ENABLE";
@@ -86,6 +88,7 @@ function loadSettings() {
     if (MODES.includes(saved.mode)) settings.mode = saved.mode;
     if (typeof saved.greenLeds === "boolean") settings.greenLeds = saved.greenLeds;
     if (typeof saved.doubleTapSwitch === "boolean") settings.doubleTapSwitch = saved.doubleTapSwitch;
+    if (DOUBLE_TAP_WINDOWS.includes(saved.doubleTapWindowMs)) settings.doubleTapWindowMs = saved.doubleTapWindowMs;
     if (typeof saved.autoUpdateCheck === "boolean") settings.autoUpdateCheck = saved.autoUpdateCheck;
   } catch {}
   log("started mod", MOD_VERSION, settings);
@@ -179,41 +182,89 @@ async function toggleReverb(state, muteKey) {
   log("tap ->", key, !current);
 }
 
-// Double tap: switch between reverb and mute mode. The firmware flipped mute twice, so it ends where it began.
+// Double tap: switch between reverb and mute mode.
 function switchMode() {
   settings.mode = settings.mode === "mute" ? "reverb" : "mute";
   saveSettings();
   log("double tap -> mode", settings.mode);
 }
 
-function onTap(state, key, previous) {
-  log("tap detected on", key, "mode", settings.mode);
-  // In reverb mode the mic should never stay muted, whether this turns out to be a single or double tap.
-  if (settings.mode === "reverb") {
-    write(state.device, key, previous).catch(err => log("failed to restore mute", key, err));
+// Puts mute keys back to how they were before a gesture, where they differ.
+function restoreMute(state, original) {
+  for (const [key, value] of original) {
+    if (state.muted.get(key) !== value) {
+      write(state.device, key, value).catch(err => log("failed to restore mute", key, err));
+    }
   }
+}
+
+function recordGesture(state, kind, gapMs) {
+  state.lastGesture = { kind, gapMs, at: Date.now() };
+  log("gesture", kind, gapMs === undefined ? "" : `gap ${gapMs} ms`);
+}
+
+// A tap is decided once no second tap can arrive any more.
+function finishSingle(state, tap) {
+  tap.done = true;
+  recordGesture(state, "single tap");
+  if (tap.mode === "mute") return;
+  if (tap.mode === "reverb") restoreMute(state, tap.original);
+  toggleReverb(state, tap.key).catch(err => log("failed to toggle reverb", err));
+}
+
+function finishDouble(state, first, kind, gapMs) {
+  if (first !== undefined) {
+    clearTimeout(first.timer);
+    first.done = true;
+  }
+  recordGesture(state, kind, gapMs);
+  switchMode();
+  // The firmware flipped mute twice, so it should be back where it was; make sure once the
+  // other channels have reported too (covers a missed or extra flip).
+  if (first !== undefined) setTimeout(() => restoreMute(state, first.original), SAME_TAP_MS + 100);
+}
+
+// Called for each mute key that flipped without the app or this mod writing it.
+function onFlip(state, key, previous) {
   const now = Date.now();
   const last = state.lastTap;
+  // Other channels flipped by the same physical tap.
+  if (last !== undefined && now - last.at < SAME_TAP_MS && !last.keys.has(key)) {
+    last.keys.add(key);
+    last.original?.set(key, previous);
+    // Without double tap detection a single tap is acted on at once, so catch up on this channel.
+    if (last.done && last.kind === "single" && last.mode === "reverb") restoreMute(state, new Map([[key, previous]]));
+    return;
+  }
+  log("tap detected on", key, "mode", settings.mode);
+  if (last !== undefined && !last.done && settings.doubleTapSwitch && now - last.at < settings.doubleTapWindowMs) {
+    state.lastTap = { at: now, keys: new Set([key]), done: true, kind: "second" };
+    finishDouble(state, last, "double tap", now - last.at);
+    return;
+  }
+  // In reverb mode nothing is written until the gesture is decided, so a quick second tap
+  // can never be mistaken for the echo of our own un-mute.
+  const tap = { at: now, keys: new Set([key]), key, done: false, kind: "single", mode: settings.mode, original: new Map([[key, previous]]) };
+  state.lastTap = tap;
+  if (settings.doubleTapSwitch) tap.timer = setTimeout(() => finishSingle(state, tap), settings.doubleTapWindowMs);
+  else finishSingle(state, tap);
+}
+
+// A batched update that reports a mute key unchanged means it flipped an even number of times
+// within one batch: a double tap faster than NDL reports.
+function onCombinedFlips(state, key) {
+  const now = Date.now();
+  const last = state.lastCombined;
   if (last !== undefined && now - last.at < SAME_TAP_MS && !last.keys.has(key)) {
     last.keys.add(key);
     return;
   }
-  if (last !== undefined && !last.done && now - last.at < DOUBLE_TAP_MS && settings.doubleTapSwitch) {
-    clearTimeout(last.timer);
-    last.done = true;
-    // Remember this second tap too, so its other channels are not counted as a new tap.
-    state.lastTap = { at: now, keys: new Set([key]), done: true };
-    switchMode();
-    return;
-  }
-  // Single tap, acted on once no second tap has arrived.
-  const tap = { at: now, keys: new Set([key]), done: false };
-  tap.timer = setTimeout(() => {
-    tap.done = true;
-    if (settings.mode === "mute") return;
-    toggleReverb(state, key).catch(err => log("failed to toggle reverb", err));
-  }, settings.doubleTapSwitch ? DOUBLE_TAP_MS : 0);
-  state.lastTap = tap;
+  state.lastCombined = { at: now, keys: new Set([key]) };
+  if (!settings.doubleTapSwitch) return;
+  log("tap detected on", key, "(two flips in one batch)");
+  const pending = state.lastTap !== undefined && !state.lastTap.done ? state.lastTap : undefined;
+  // A pending single tap plus two more flips is a triple tap: treat it as a double and undo the extra flip.
+  finishDouble(state, pending, "double tap (fast)", undefined);
 }
 
 // ---- green lights while reverb is on ----
@@ -283,26 +334,44 @@ function handleEvent(state, properties, eventType) {
     if (!isKey(key, MUTE) || typeof value !== "boolean") continue;
     const previous = state.muted.get(key);
     state.muted.set(key, value);
-    // Snapshots and repeats are not taps.
-    if (eventType !== "update" || previous === undefined || previous === value) continue;
+    // Snapshots are not taps.
+    if (eventType !== "update" || previous === undefined) continue;
     const own = state.selfWrites.get(key);
     if (own !== undefined && own.value === value && Date.now() - own.at < SELF_WRITE_WINDOW_MS) {
       state.selfWrites.delete(key);
       continue;
     }
-    onTap(state, key, previous);
+    if (previous === value) onCombinedFlips(state, key);
+    else onFlip(state, key, previous);
   }
 }
 
 // One subscription per key, so a key the firmware rejects does not take the others down.
-async function watch(state, key) {
+// Mute keys ask for short event batches; if NDL refuses, fall back to its default batching.
+async function watch(state, key, aggregationMs) {
+  const own = new AbortController();
+  const stop = () => own.abort();
+  state.abort.signal.addEventListener("abort", stop, { once: true });
+  let failed = false;
   try {
-    for await (const event of state.device.subscribeProperties([key], state.abort.signal)) {
+    for await (const event of state.device.subscribeProperties([key], own.signal, aggregationMs)) {
       if (event.type === "snapshot" || event.type === "update") handleEvent(state, event.properties, event.type);
-      else if (event.type === "error") log("subscription error", key, event.message);
+      else if (event.type === "error") {
+        log("subscription error", key, aggregationMs, event.message);
+        failed = true;
+        break;
+      }
     }
   } catch (err) {
-    if (!state.abort.signal.aborted) log("subscription failed", key, err);
+    failed = !state.abort.signal.aborted;
+    if (failed) log("subscription failed", key, aggregationMs, err);
+  } finally {
+    state.abort.signal.removeEventListener("abort", stop);
+    own.abort();
+  }
+  if (failed && aggregationMs !== undefined && !state.abort.signal.aborted) {
+    log("retrying with default event batching", key);
+    return watch(state, key, undefined);
   }
 }
 
@@ -312,7 +381,8 @@ async function setup(device) {
   previous?.abort.abort();
   const state = {
     device, abort: new AbortController(), muted: new Map(), reverb: new Map(), selfWrites: new Map(),
-    muteKeys: [], reverbKeys: [], ledKeys: [], watchKeys: [], lastTap: undefined, status: "connecting",
+    muteKeys: [], reverbKeys: [], ledKeys: [], watchKeys: [], lastTap: undefined, lastCombined: undefined,
+    lastGesture: undefined, status: "connecting",
     ledBackup: undefined, ledQueue: Promise.resolve(),
   };
   devices.set(device.hardwareId, state);
@@ -330,7 +400,7 @@ async function setup(device) {
     state.status = state.muteKeys.length === 0 ? "no mute property found"
       : state.reverbKeys.length === 0 ? "no reverb property found"
       : "ready";
-    for (const key of state.watchKeys) watch(state, key);
+    for (const key of state.watchKeys) watch(state, key, isKey(key, MUTE) ? MUTE_AGGREGATION_MS : undefined);
   } catch (err) {
     state.status = "setup failed";
     log("setup failed", err);
@@ -378,7 +448,11 @@ function onWrite(device, key, value) {
 function status() {
   const states = [...devices.values()];
   if (states.length === 0) return "MV7i not detected" + (modelsSeen.size ? ` (seen: ${[...modelsSeen].join(", ")})` : "");
-  return states.map(s => s.status).join("; ");
+  return states.map(s => {
+    const g = s.lastGesture;
+    if (g === undefined || Date.now() - g.at > 60000) return s.status;
+    return `${s.status} - last: ${g.kind}` + (g.gapMs === undefined ? "" : ` (${(g.gapMs / 1000).toFixed(2)} s apart)`);
+  }).join("; ");
 }
 
 // ---- updates from GitHub ----
@@ -473,9 +547,14 @@ const UI_SCRIPT = `(() => {
     const green = el("input");
     green.type = "checkbox";
     green.addEventListener("change", () => call("set", { greenLeds: green.checked }).then(render));
-    const doubleTap = el("input");
-    doubleTap.type = "checkbox";
-    doubleTap.addEventListener("change", () => call("set", { doubleTapSwitch: doubleTap.checked }).then(render));
+    const doubleTap = el("select", select.style.cssText);
+    for (const [value, text] of [["off", "Off"], ["500", "Fast (0.5 s)"], ["800", "Normal (0.8 s)"], ["1200", "Relaxed (1.2 s)"]]) {
+      const option = el("option", "color:#000", text);
+      option.value = value;
+      doubleTap.append(option);
+    }
+    doubleTap.addEventListener("change", () => call("set", doubleTap.value === "off" ? { doubleTapSwitch: false }
+      : { doubleTapSwitch: true, doubleTapWindowMs: Number(doubleTap.value) }).then(render));
     const note = el("small", "opacity:.6");
     const upd = el("div", "display:flex;align-items:center;justify-content:space-between;gap:8px;opacity:.85");
     const updText = el("small", "cursor:pointer;text-decoration:underline dotted");
@@ -489,12 +568,12 @@ const UI_SCRIPT = `(() => {
       updButton.disabled = true;
       call(action === "install" ? "installUpdate" : "checkUpdate").catch(err => alert("Update failed: " + err.message)).finally(render);
     });
-    wrap.append(row("Touch panel tap", select), row("Double-tap switches reverb/mute", doubleTap), row("Green lights while reverb is on", green), note, upd);
+    wrap.append(row("Touch panel tap", select), row("Double tap switches reverb/mute", doubleTap), row("Green lights while reverb is on", green), note, upd);
     function render() {
       return call("state").then(s => {
         select.value = s.mode;
         green.checked = s.greenLeds;
-        doubleTap.checked = s.doubleTapSwitch;
+        doubleTap.value = s.doubleTapSwitch ? String(s.doubleTapWindowMs) : "off";
         note.textContent = "MV7i mod: " + s.status;
         const u = s.update;
         updButton.disabled = u.state === "checking" || u.state === "installing";
@@ -539,6 +618,10 @@ const handlers = {
       for (const state of devices.values()) syncLeds(state);
     }
     if (changes?.doubleTapSwitch !== undefined) settings.doubleTapSwitch = Boolean(changes.doubleTapSwitch);
+    if (changes?.doubleTapWindowMs !== undefined) {
+      if (!DOUBLE_TAP_WINDOWS.includes(changes.doubleTapWindowMs)) throw new Error("bad double tap window");
+      settings.doubleTapWindowMs = changes.doubleTapWindowMs;
+    }
     if (changes?.autoUpdateCheck !== undefined) settings.autoUpdateCheck = Boolean(changes.autoUpdateCheck);
     saveSettings();
     log("settings", settings);
