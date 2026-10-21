@@ -17,10 +17,22 @@ A free, unofficial mod for the **Shure MOTIV Mix** desktop app (Windows). It let
 | | |
 |---|---|
 | **Touch panel tap action** | Choose what a tap on the MV7i's touch panel does: **Mute** (stock), **Reverb on/off**, or **Mute + reverb on/off**. |
+| **Double tap to switch modes** | **Tap** the touch panel to do the current action (mute, or reverb on/off). **Double tap** it to switch between **Reverb mode** and **Mute mode**, with no need to open the app. Can be switched off. |
 | **Green lights for reverb** | While reverb is on, the touch panel lights turn green instead of the usual colour, so you can see it at a glance. Your own light colours come back when reverb turns off. Can be switched off. |
 | **Both windows** | The settings appear on the MV7i page in the full MOTIV Mix window **and** in the small tray window. |
 | **In-app updates** | The mod checks this GitHub repository for new releases and shows an **Install update** button. One click downloads the new installer, verifies its checksum, and installs it. |
 | **One-file installer** | A single `MV7i-Mod-Installer.cmd`: double-click to install, update or uninstall. |
+
+### Tap and double tap
+
+| Gesture | Mute mode | Reverb mode |
+|---|---|---|
+| Single tap | Mute / unmute (instant) | Reverb on / off |
+| Double tap (two taps within half a second) | Switch to Reverb mode | Switch to Mute mode |
+
+A double tap leaves the mute exactly as it was (the mic mutes on the first tap and unmutes on the second). Because the mod waits half a second to tell a single tap from a double tap, a single tap in Reverb mode takes effect after about 0.5 s. Turn off **Double-tap switches reverb/mute** in the mod panel if you'd rather have no delay. Mute mode is always instant, because the mic mutes on its own.
+
+> A press-and-hold gesture isn't possible: the mic only tells MOTIV Mix that its mute changed, not how long the panel was touched.
 
 In **Reverb on/off** mode the mic firmware still mutes on a tap, and the mod un-mutes it straight away, so you may see the lights flash red for a moment before going green (reverb on) or back to your normal colour (reverb off).
 
@@ -34,6 +46,7 @@ In **Reverb on/off** mode the mic firmware still mutes on a tap, and the mod un-
 4. Read the notice, type `YES`, and let it finish. It closes MOTIV Mix if it is running and offers to reopen it.
 5. In MOTIV Mix, select your MV7i. At the bottom of its page you'll find:
    - **Touch panel tap**: Mute (default) / Reverb on/off / Mute + reverb on/off
+   - **Double-tap switches reverb/mute**
    - **Green lights while reverb is on**
    - the mod status, version, and update button
 

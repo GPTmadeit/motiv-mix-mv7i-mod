@@ -9,6 +9,8 @@
 //   "mute"        - stock behaviour, do nothing
 //   "reverb"      - put mute back the way it was, toggle reverb
 //   "mute+reverb" - leave mute alone, toggle reverb
+// A double tap switches between reverb and mute mode; single taps then wait
+// DOUBLE_TAP_MS before acting, to be sure no second tap is coming.
 const { app, ipcMain, net, shell } = require("electron");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
@@ -16,17 +18,20 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const MOD_VERSION = "3.0.0";
+const MOD_VERSION = "3.1.0";
 const REPO = "GPTmadeit/motiv-mix-mv7i-mod";
 const INSTALLER_ASSET = "MV7i-Mod-Installer.cmd";
 
 const MODES = ["mute", "reverb", "mute+reverb"];
-const DEFAULT_SETTINGS = { mode: "mute", greenLeds: true, autoUpdateCheck: true };
+const DEFAULT_SETTINGS = { mode: "mute", greenLeds: true, doubleTapSwitch: true, autoUpdateCheck: true };
 const isMv7i = device => String(device?.model ?? "").toUpperCase().startsWith("MV7I");
 // A mute event matching one of the app's own writes within this window is not a tap.
 const SELF_WRITE_WINDOW_MS = 2500;
-// One tap can flip several mute keys (device + channels); toggle reverb once.
-const TAP_DEBOUNCE_MS = 400;
+// One tap can flip several mute keys (device + channels). Flips of keys not yet seen
+// within this window belong to the same tap; a key flipping again is a new tap.
+const SAME_TAP_MS = 300;
+// A second tap starting within this window of the first is a double tap.
+const DOUBLE_TAP_MS = 500;
 const UPDATE_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000;
 const MUTE = "AUDIO:MUTE";
 const REVERB = "AUDIO:REVERB_ENABLE";
@@ -80,6 +85,7 @@ function loadSettings() {
     const saved = JSON.parse(fs.readFileSync(dataFile("tap-action.json"), "utf8"));
     if (MODES.includes(saved.mode)) settings.mode = saved.mode;
     if (typeof saved.greenLeds === "boolean") settings.greenLeds = saved.greenLeds;
+    if (typeof saved.doubleTapSwitch === "boolean") settings.doubleTapSwitch = saved.doubleTapSwitch;
     if (typeof saved.autoUpdateCheck === "boolean") settings.autoUpdateCheck = saved.autoUpdateCheck;
   } catch {}
   log("started mod", MOD_VERSION, settings);
@@ -173,16 +179,41 @@ async function toggleReverb(state, muteKey) {
   log("tap ->", key, !current);
 }
 
+// Double tap: switch between reverb and mute mode. The firmware flipped mute twice, so it ends where it began.
+function switchMode() {
+  settings.mode = settings.mode === "mute" ? "reverb" : "mute";
+  saveSettings();
+  log("double tap -> mode", settings.mode);
+}
+
 function onTap(state, key, previous) {
   log("tap detected on", key, "mode", settings.mode);
-  if (settings.mode === "mute") return;
+  // In reverb mode the mic should never stay muted, whether this turns out to be a single or double tap.
   if (settings.mode === "reverb") {
     write(state.device, key, previous).catch(err => log("failed to restore mute", key, err));
   }
   const now = Date.now();
-  if (now - state.lastTap < TAP_DEBOUNCE_MS) return;
-  state.lastTap = now;
-  toggleReverb(state, key).catch(err => log("failed to toggle reverb", err));
+  const last = state.lastTap;
+  if (last !== undefined && now - last.at < SAME_TAP_MS && !last.keys.has(key)) {
+    last.keys.add(key);
+    return;
+  }
+  if (last !== undefined && !last.done && now - last.at < DOUBLE_TAP_MS && settings.doubleTapSwitch) {
+    clearTimeout(last.timer);
+    last.done = true;
+    // Remember this second tap too, so its other channels are not counted as a new tap.
+    state.lastTap = { at: now, keys: new Set([key]), done: true };
+    switchMode();
+    return;
+  }
+  // Single tap, acted on once no second tap has arrived.
+  const tap = { at: now, keys: new Set([key]), done: false };
+  tap.timer = setTimeout(() => {
+    tap.done = true;
+    if (settings.mode === "mute") return;
+    toggleReverb(state, key).catch(err => log("failed to toggle reverb", err));
+  }, settings.doubleTapSwitch ? DOUBLE_TAP_MS : 0);
+  state.lastTap = tap;
 }
 
 // ---- green lights while reverb is on ----
@@ -281,7 +312,7 @@ async function setup(device) {
   previous?.abort.abort();
   const state = {
     device, abort: new AbortController(), muted: new Map(), reverb: new Map(), selfWrites: new Map(),
-    muteKeys: [], reverbKeys: [], ledKeys: [], watchKeys: [], lastTap: 0, status: "connecting",
+    muteKeys: [], reverbKeys: [], ledKeys: [], watchKeys: [], lastTap: undefined, status: "connecting",
     ledBackup: undefined, ledQueue: Promise.resolve(),
   };
   devices.set(device.hardwareId, state);
@@ -442,6 +473,9 @@ const UI_SCRIPT = `(() => {
     const green = el("input");
     green.type = "checkbox";
     green.addEventListener("change", () => call("set", { greenLeds: green.checked }).then(render));
+    const doubleTap = el("input");
+    doubleTap.type = "checkbox";
+    doubleTap.addEventListener("change", () => call("set", { doubleTapSwitch: doubleTap.checked }).then(render));
     const note = el("small", "opacity:.6");
     const upd = el("div", "display:flex;align-items:center;justify-content:space-between;gap:8px;opacity:.85");
     const updText = el("small", "cursor:pointer;text-decoration:underline dotted");
@@ -455,11 +489,12 @@ const UI_SCRIPT = `(() => {
       updButton.disabled = true;
       call(action === "install" ? "installUpdate" : "checkUpdate").catch(err => alert("Update failed: " + err.message)).finally(render);
     });
-    wrap.append(row("Touch panel tap", select), row("Green lights while reverb is on", green), note, upd);
+    wrap.append(row("Touch panel tap", select), row("Double-tap switches reverb/mute", doubleTap), row("Green lights while reverb is on", green), note, upd);
     function render() {
       return call("state").then(s => {
         select.value = s.mode;
         green.checked = s.greenLeds;
+        doubleTap.checked = s.doubleTapSwitch;
         note.textContent = "MV7i mod: " + s.status;
         const u = s.update;
         updButton.disabled = u.state === "checking" || u.state === "installing";
@@ -503,6 +538,7 @@ const handlers = {
       settings.greenLeds = Boolean(changes.greenLeds);
       for (const state of devices.values()) syncLeds(state);
     }
+    if (changes?.doubleTapSwitch !== undefined) settings.doubleTapSwitch = Boolean(changes.doubleTapSwitch);
     if (changes?.autoUpdateCheck !== undefined) settings.autoUpdateCheck = Boolean(changes.autoUpdateCheck);
     saveSettings();
     log("settings", settings);

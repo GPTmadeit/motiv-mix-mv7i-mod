@@ -32,7 +32,7 @@ Module._load = function (request, ...rest) {
   return load.call(this, request, ...rest);
 };
 require(path.join(__dirname, "..", "src", "tap-action.js"));
-const { onManager, onDevice, onWrite, status, expandKeys, newer } = globalThis.__motivTapAction;
+const { onManager, onDevice, onWrite, status, expandKeys, newer, MOD_VERSION } = globalThis.__motivTapAction;
 const appEvent = { senderFrame: { url: "file:///C:/app/tray-renderer/index.html" } };
 const call = (name, arg) => handlers["motiv-tap-action:" + name](appEvent, arg);
 
@@ -130,7 +130,7 @@ const STOCK_LIGHTS = [0, BLUE, 0, BLUE];
   await connect(d);
   assert.deepStrictEqual(d.subscribed, [], "not set up until online");
 
-  await call("set", { mode: "mute+reverb", greenLeds: false });
+  await call("set", { mode: "mute+reverb", greenLeds: false, doubleTapSwitch: false });
   d = fakeDevice("b");
   await connect(d);
   tap(d); await tick();
@@ -224,12 +224,74 @@ const STOCK_LIGHTS = [0, BLUE, 0, BLUE];
   assert.deepStrictEqual(lights(d), GREEN_LIGHTS, "probed light keys work too");
   onManager(goodManager, { parseDeviceDescription: () => description });
 
+  // --- double tap switches between reverb and mute mode ---
+  await call("set", { mode: "reverb", greenLeds: false, doubleTapSwitch: true });
+  await wait(550);
+  d = fakeDevice("dt1");
+  await connect(d);
+  tap(d); await tick();
+  assert.deepStrictEqual(d.writes, [[MUTE, false]], "mute undone at once, reverb waits for a possible second tap");
+  await wait(550);
+  assert.deepStrictEqual(d.writes, [[MUTE, false], [REVERB, true]], "single tap toggles reverb after the window");
+
+  await wait(100);
+  tap(d); await wait(150); tap(d); await wait(600);
+  assert.strictEqual((await call("state")).mode, "mute", "double tap switches reverb -> mute");
+  assert.strictEqual(d.props[REVERB], true, "double tap does not toggle reverb");
+  assert.strictEqual(d.props[MUTE], false, "mic ends unmuted");
+
+  // now in mute mode: a single tap just mutes (firmware), a double tap switches back
+  d.writes.length = 0;
+  tap(d); await wait(600);
+  assert.deepStrictEqual(d.writes, [], "mute mode leaves the firmware mute alone");
+  assert.strictEqual(d.props[MUTE], true);
+  tap(d); await wait(600); // unmute again
+  tap(d); await wait(150); tap(d); await wait(600);
+  assert.strictEqual((await call("state")).mode, "reverb", "double tap switches mute -> reverb");
+  assert.strictEqual(d.props[MUTE], false, "mute flipped twice, so unchanged");
+  assert.deepStrictEqual(d.writes, [], "no writes for a double tap in mute mode");
+
+  // one tap that flips two channels is still one tap, and so is a double tap of it
+  d = fakeDevice("dt2");
+  await connect(d);
+  tap(d, MUTE); tap(d, MUTE2); await wait(150); tap(d, MUTE); tap(d, MUTE2); await wait(600);
+  assert.strictEqual((await call("state")).mode, "mute", "multi-channel double tap switches once");
+  assert.strictEqual(d.props[REVERB], false);
+  tap(d, MUTE); tap(d, MUTE2); await wait(150); tap(d, MUTE); tap(d, MUTE2); await wait(600);
+  assert.strictEqual((await call("state")).mode, "reverb");
+
+  // taps further apart than the window are two single taps
+  d = fakeDevice("dt3");
+  await connect(d);
+  tap(d); await wait(650); tap(d); await wait(600);
+  assert.strictEqual((await call("state")).mode, "reverb");
+  assert.deepStrictEqual(d.writes.filter(([k]) => k === REVERB), [[REVERB, true], [REVERB, false]]);
+
+  // mute + reverb mode: a double tap goes to mute mode
+  await call("set", { mode: "mute+reverb" });
+  d = fakeDevice("dt4");
+  await connect(d);
+  tap(d); await wait(150); tap(d); await wait(600);
+  assert.strictEqual((await call("state")).mode, "mute");
+  assert.deepStrictEqual(d.writes, []);
+
+  // with the option off, two quick taps are two instant actions
+  await call("set", { mode: "reverb", doubleTapSwitch: false });
+  d = fakeDevice("dt5");
+  await connect(d);
+  tap(d); await tick();
+  assert.deepStrictEqual(d.writes, [[MUTE, false], [REVERB, true]], "no delay when double tap is off");
+  await wait(150); tap(d); await tick();
+  assert.strictEqual(d.props[REVERB], false);
+  assert.strictEqual((await call("state")).mode, "reverb");
+  await call("set", { greenLeds: true });
+
   // --- settings and bridge ---
   const state = await call("state");
   assert.strictEqual(state.mode, "reverb");
   assert.strictEqual(state.greenLeds, true);
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(userData, "tap-action.json"))),
-    { mode: "reverb", greenLeds: true, autoUpdateCheck: true });
+    { mode: "reverb", greenLeds: true, doubleTapSwitch: false, autoUpdateCheck: true });
   assert.throws(() => call("set", { mode: "explode" }));
   assert.throws(() => handlers["motiv-tap-action:state"]({ senderFrame: { url: "https://evil.example" } }));
 
@@ -241,13 +303,13 @@ const STOCK_LIGHTS = [0, BLUE, 0, BLUE];
     { name: "MV7i-Mod-Installer.cmd", browser_download_url: "https://dl/installer" },
     { name: "MV7i-Mod-Installer.cmd.sha256", browser_download_url: "https://dl/sha" },
   ];
-  fetchRoutes = { [api]: { tag_name: "v3.0.0", assets, html_url: "https://gh/r" } };
+  fetchRoutes = { [api]: { tag_name: "v" + MOD_VERSION, assets, html_url: "https://gh/r" } };
   assert.strictEqual((await call("checkUpdate")).state, "current");
-  fetchRoutes = { [api]: { tag_name: "v3.1.0", assets, html_url: "https://gh/r" }, "https://dl/installer": installer,
+  fetchRoutes = { [api]: { tag_name: "v99.0.0", assets, html_url: "https://gh/r" }, "https://dl/installer": installer,
     "https://dl/sha": "0000  MV7i-Mod-Installer.cmd\n" };
   const info = await call("checkUpdate");
   assert.strictEqual(info.state, "available");
-  assert.strictEqual(info.latest.version, "3.1.0");
+  assert.strictEqual(info.latest.version, "99.0.0");
   await assert.rejects(call("installUpdate"), /checksum/, "a corrupted download is refused");
   assert.strictEqual(spawned.length, 0);
   await call("checkUpdate");
